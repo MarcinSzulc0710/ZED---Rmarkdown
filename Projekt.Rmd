@@ -1,0 +1,197 @@
+---
+title: "Supercapacitors - Analysis of Graphene Electrode Data"
+author: "Marcin Szulc"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: united
+    df_print: paged
+---
+
+## Introduction
+Analizowany zbiór danych zawiera 925 rekordów oraz 21 cech opisujących elektrody grafenowe, stosowane w superkondensatorach. Po wykonaniu raportu można stwirdzić najważniejszy fakt, którym jest brak dużej ilości danych. Ten problem został rozwiązany poprzez wpisaniu 0 w brakujacych miejsach. Najbardziej kompletne zbiory to zbiór "electrolyte concentration" oraz "electro conductivity". Analiza rozkładu kolumny o nazwie "capacitance" wykazała znaczną zmienność w danych. Macierz korelacji cech numerycznych nie ujawniła silnej zależności pomiędzy analizowanymi parametrami. Korzystając z Nested cross-Validation zbiór został podzielony na 30% danych testowych oraz 70% danych uczących. Dzięki temu model nie zapamiętuje wyników z przeprowadzonego eksprymentu i po wprowadzeniu biblioteki iml jest w stanie działać na "świeżych danych". Dane uzyskane po machine learningu pokazują, że predykcja modelu jest na poziomie około 68%. Taki wynik pokazuje, że model jest w stanie wychwycić dużą część zależności występujacych w zbiorze danych, ale nie wszystkie.
+
+```{r setup, include=FALSE}
+setwd("C:/Users/mmarc/Desktop/Studia/Informatyka/Semestr 2/Zaawansowane eksploracja danych/Projekt")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+set.seed(12345) 
+
+# Applying libraries
+library(tidyverse)
+library(data.table)
+library(janitor)
+library(naniar)
+library(skimr)
+library(future)
+library(ggplot2)
+library(plotly)
+library(ggcorrplot)
+library(GGally)
+library(corrplot)
+library(randomForest)
+library(DALEX)
+library(iml)
+library(ModelMetrics)
+library(SHAPforxgboost)
+
+
+# Searching for existing libraries
+read_data <- function(path = "data.csv") {
+  if(!file.exists(path)) stop()
+  dt <- fread(path, na.strings = c("", "NA", "na", "-"))
+  dt <- clean_names(dt)
+  return(as_tibble(dt))
+}
+```
+
+## Loading data
+
+```{r load-data}
+data <- tryCatch(read_data("data.csv"), error = function(e) {
+  message(e$message)
+  data[is.na(data)] <- 0
+  NULL
+})
+
+if(is.null(data)) stop()
+
+glimpse(data)
+```
+
+## Basis statistics
+
+```{r basic-stats}
+n_obs <- nrow(data); n_vars <- ncol(data)
+cat(paste0("Liczba obserwacji: ", n_obs, "\nLiczba zmiennych: ", n_vars, "\n"))
+
+# Using skimr  
+skimr::skim(data)
+
+table(data$cell_configuration)
+```
+
+## Distribution analysis
+
+```{r distributions, fig.height=6}
+# Histograms
+plot_vars <- c('capacitance_f_g','specific_surface_area_m2_g','pore_size_nm','pore_volume_cm3_g','charge_transfer_resistance_rct_ohm','equivalent_series_resistance_rs_ohm')
+plot_vars <- intersect(plot_vars, names(data))
+
+plots <- lapply(plot_vars, function(v){
+  p <- ggplot(data, aes_string(x = v)) +
+    geom_histogram(bins = 30, alpha = 0.6) +
+    geom_density(aes(y = ..count..), color = "blue", size = 0.7) +
+    ggtitle(paste("Rozkład:", v)) + theme_minimal()
+  ggplotly(p)
+})
+
+# First plot as example
+if(length(plots)>0) plots[[1]]
+```
+
+## Coleration analysis
+
+```{r correlation, fig.height=6}
+num_data <- data %>% select(where(is.numeric))
+cor_mat <- cor(num_data, use = 'pairwise.complete.obs')
+
+# Heatmap
+ggcorrplot::ggcorrplot(cor_mat, lab = TRUE, lab_size = 3, legend.title = "r")
+
+# Interactive plot
+if(ncol(num_data) <= 10){
+  gg <- GGally::ggpairs(num_data)
+  print(gg)
+}
+
+```
+
+## Interactive plots
+
+```{r interactive}
+if(all(c('specific_surface_area_m2_g', 'capacitance_f_g') %in% names(data))){
+  p <- ggplot(data, aes(x = specific_surface_area_m2_g, y = capacitance_f_g, text = paste('Ref:', ref))) +
+    geom_point() + theme_minimal() + ggtitle('SSA vs Capacitance')
+  ggplotly(p)
+}
+```
+
+## Building train and test models
+
+```{r, models}
+
+for (col in names(data)) {
+  if (is.numeric(data[[col]])) {
+    data[[col]][is.na(data[[col]])] <- 0
+  } else if (is.character(data[[col]])) {
+    data[[col]][is.na(data[[col]])] <- ""
+  } else if (is.factor(data[[col]])) {
+    levels(data[[col]]) <- c(levels(data[[col]]), "Unknown")
+    data[[col]][is.na(data[[col]])] <- "Unknown"
+  }
+}
+
+
+set.seed(123)
+
+train_index <- sample(seq_len(nrow(data)), size = 0.7 * nrow(data))
+
+train_data <- data[train_index, ]
+test_data  <- data[-train_index, ]
+
+cat("Train size:", nrow(train_data), "\n")
+cat("Test size:", nrow(test_data), "\n")
+
+```
+
+## Random forest
+
+```{r, rf}
+
+rf_model <- randomForest(
+capacitance_f_g ~ .,
+data = train_data,
+ntree = 400,
+importance = TRUE
+)
+
+rf_model
+
+```
+
+## Model evaluation
+
+```{r, me}
+pred <- predict(rf_model, newdata = test_data)
+
+mae  <- mean(abs(pred - test_data$capacitance_f_g))
+rmse <- sqrt(mean((pred - test_data$capacitance_f_g)^2))
+r2   <- cor(pred, test_data$capacitance_f_g)^2
+
+cat("MAE:", mae, "\n")
+cat("RMSE:", rmse, "\n")
+cat("R²:", r2, "\n")
+
+```
+
+## Using Machine Learning
+
+```{r, ml}
+
+X_train <- train_data %>% select(-capacitance_f_g)
+y_train <- train_data$capacitance_f_g
+
+predictor <- Predictor$new(
+  model = rf_model,
+  data = X_train,
+  y = y_train
+)
+
+shap <- Shapley$new(predictor, x.interest = X_train[1, ])
+shap$plot()
+
+
+```
